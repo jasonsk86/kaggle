@@ -5,9 +5,12 @@
 library(tidyverse)
 library(caret)
 library(randomForest)
+library(xgboost)
 library(scales)
 library(patchwork)
 library(car)
+library(broom)
+library(tidylog)
 
 # Global setup ------------------------------------------------------------
 
@@ -15,11 +18,9 @@ theme_set(ggthemes::theme_economist())
 
 # Load data ---------------------------------------------------------------
 
-train_orig <- read_csv('data/train.csv', col_names = T)
-train <- train_orig
+df_orig <- read_csv('data/train.csv', col_names = T)
 
-test_orig <- read_csv('data/test.csv', col_names = T)
-test <- test_orig
+df <- df_orig
 
 
 # Preprocessing -----------------------------------------------------------
@@ -29,7 +30,7 @@ test <- test_orig
   # 2. Deal with missing values 
 
 # > Data summary ----  
-train_summary <- train %>% 
+df_summary <- df %>% 
   map_dfr(~data.frame(
               unique_values =n_distinct(.),
               class =class(.),
@@ -41,7 +42,7 @@ train_summary <- train %>%
 # > Deal with NAs ----
 
 # Lots of missing values for pool quality, miscfeature, alley and fence etc.
-train_summary %>% 
+df_summary %>% 
   arrange(-NAs) %>% 
   head(10)
 
@@ -49,7 +50,7 @@ train_summary %>%
 # In the data description file, NAs represent an absence of a features
 # Thus, just convert these NAs to "None" (or 0 in the case for numeric features) as that in itself will act as a useful bit of information potentially when modelling
 
-train <- train %>% 
+df <- df %>% 
   mutate_if(is.character, ~replace(., is.na(.), "none")) %>% 
   mutate_if(is.numeric, ~replace(., is.na(.), 0))
 
@@ -62,7 +63,7 @@ train <- train %>%
 
 
 # > Correlation ----
-correlations <- train %>% 
+correlations <- df %>% 
   select_if(is.numeric) %>% 
   cor() 
 
@@ -104,11 +105,11 @@ ggplot(pred_resp_cor, aes(x = reorder(feature, cor), y = cor, fill = cor)) +
 
 # > Outliers ----
 
-p_out <- ggplot(train, aes(y = SalePrice)) +
+p_out <- ggplot(df, aes(y = SalePrice)) +
   geom_boxplot() +
   scale_y_continuous(labels = comma)
 
-p_hist <- ggplot(train, aes(x = SalePrice)) +
+p_hist <- ggplot(df, aes(x = SalePrice)) +
   geom_histogram(colour = "white") +
   scale_x_continuous(labels = comma)
 
@@ -123,7 +124,7 @@ wrap_elements(p_hist + p_out) + ggtitle("Distribution of House Sale Prices")
 # > New features ----
 
 # add feature for if there were any remodelling or additions made to the house 
-train <- train %>% 
+df <- df %>% 
   mutate(remodeled = ifelse(YearRemodAdd == YearBuilt, "N", "Y"))
 
 
@@ -132,17 +133,17 @@ train <- train %>%
 # use PCA to reduce dimensionality and created variables based on principal componts
 
 # Principal Componets Analysis (PCA)
-train_pca <- train %>% 
+pca <- df %>% 
   select_if(is.numeric) %>% 
   select(-SalePrice) %>% 
   prcomp(scale = TRUE, center = TRUE)
 
 # extract observation/individual principal comonents
-pca_ind <- factoextra::get_pca_ind(train_pca)
+pca_ind <- factoextra::get_pca_ind(pca)
 pca_ind$coord
 
 # extract variable principal compontns
-pca_var <- factoextra::get_pca_var(train_pca)
+pca_var <- factoextra::get_pca_var(pca)
 pca_var$coord
 
 # visualize loadings for first 3 principal components
@@ -167,7 +168,7 @@ factoextra::fviz_screeplot(train_pca)
 factoextra::fviz_pca_var(train_pca)
 
 # add pc1 and pc2 into dataset 
-train <- train %>% 
+df <- df %>% 
   mutate(pc1 = pca_ind$coord[, 1],
          pc2 = pca_ind$coord[, 2]) %>% 
   select(-SalePrice, everything(), SalePrice) # so response variable is back at most right column
@@ -180,7 +181,7 @@ features_to_drop <- pred_resp_cor %>%
   filter(abs(cor) < 0.2) %>% 
   pull(feature)
 
-train <- train %>% 
+df <- df %>% 
   select(-one_of(features_to_drop))
 
 
@@ -189,53 +190,42 @@ train <- train %>%
 # Check for any categorical variables that have very low frequencies 
 # Should hopefully make models bit more robust and not overfit to niche examples
 
-var_frequencies <- train %>% 
+var_frequencies <- df %>% 
   select_if(is.character) %>% 
   pivot_longer(
     cols = everything()
   ) %>% 
-  count(name, value) %>% 
+  count(name, value)
   
 
 # which variables have sub-attributes with low occurences
-var_frequencies %>%
-  filter(n < 5) %>% 
+vars_to_bin <- var_frequencies %>%
+  filter(n < 30) %>% 
   group_by(name) %>% 
   summarize(low_atts = n_distinct(value)) %>% 
-  arrange(-low_atts)
+  arrange(-low_atts) %>% 
+  pull(name)
 
-# conditon2
-  # this relates to the proximity to various conditions (if more than one is present)
-  # here just bin into 'normal' and 'other' to reduce cardinality of variable
+vars_to_bin
 
-train$Condition2 %>% table()
+# function to bin variables that have low frequencie
+set_to_other <- function(col, threshold) {
+  
+  # first summarise column by count of each value
+  counts <- table(col)
+  
+  low <- counts[counts < threshold]
+  low <- names(low)
+  
+  # replace values of rare categories with "Other"
+  col <- ifelse(col %in% low, "Other", col)
 
-train <- train %>% 
-  mutate(Condition2 = ifelse(Condition2 == "Norm", "Norm", "Other"))
+}
 
-# exterior1st
-  # this relates to the exterior covering the house
-  # here again just group anything under 5 as other 
-train$Exterior1st %>% table()
 
-exterior1st_other <- train %>% 
-  count(Exterior1st) %>% 
-  filter(n < 5) %>% 
-  pull(Exterior1st)
-
-train <- train %>% 
-  mutate(Exterior1st = ifelse(Exterior1st %in% exterior1st_other, "Other", Exterior1st))
-
-# RoofMatl
-train$RoofMatl %>% table()
-
-RoofMatl_other <- train %>% 
-  count(RoofMatl) %>% 
-  filter(n < 5) %>% 
-  pull(RoofMatl)
-
-train <- train %>% 
-  mutate(RoofMatl = ifelse(RoofMatl %in% RoofMatl_other, "Other", RoofMatl))
+df <- df %>% 
+  mutate_at(vars(one_of(vars_to_bin)), 
+            ~set_to_other(., 30))
 
 
 # > Log Transform ---- 
@@ -243,10 +233,10 @@ train <- train %>%
 # Create new response value that is log transform of SalePrice. This should help reduce the skewed nature of the data
 # should also decrease the effect of outliers when modelling, particularly with regression techniques
 
-train <- train %>% 
+df <- df %>% 
   mutate(log_SalePrice = log10(SalePrice))
 
-p_log_hist <- ggplot(train, aes(x = log_SalePrice)) +
+p_log_hist <- ggplot(df, aes(x = log_SalePrice)) +
   geom_histogram(colour = "white") +
   labs(x = "log Sale Price")
 
@@ -255,19 +245,84 @@ wrap_elements(p_hist + p_log_hist) +
 
 
 
+
+# Train / test partition --------------------------------------------------
+
+idx <- sample(0:1, nrow(df), replace = T, prob = c(0.15, 0.85))
+
+train <- df[idx == 1, ]
+test <- df[idx == 0, ]
+
+
 # Modelling ---------------------------------------------------------------
 
 
 # > Multiple linear regression -------------------------------------------------------
 
 
+# >> Using original Sale Price -----------------------------------------------
+
+
+lm_model <- train %>% 
+  select(-one_of('pc1', 'pc2', 'log_SalePrice')) %>% 
+  lm(SalePrice ~ ., data = .)
+
+lm_model_sum <- tidy(lm_model)
+
+summary(lm_model)$r.squared
+summary(lm_model)$adj.r.squared
+lm_model_sum
+
+# Using log Sale Price ----------------------------------------------------
+
+lm_model_2 <- train %>% 
+  select(-one_of('pc1', 'pc2', 'SalePrice')) %>% 
+  lm(log_SalePrice ~ ., data = .)
+
+lm_model_2_sum <- tidy(lm_model_2)
+
+summary(lm_model_2)$r.squared
+summary(lm_model_2)$adj.r.squared
+lm_model_2_sum
 
 
 # Random forest -----------------------------------------------------------
 
+rf_control <- trainControl(method = "none")
 
+rf_model <- train %>% 
+  select(-one_of('pc1', 'pc2', 'log_SalePrice')) %>% 
+  train(SalePrice ~ ., 
+        data = .,
+        method = 'rf', 
+        trControl = rf_control,
+        ntree = 100)
+
+summary(rf_model)
 
 # Gradient boosting -------------------------------------------------------
 
+xgb_control <- trainControl(method = "none")
 
+xgb_model <- train %>% 
+  select(-one_of('pc1', 'pc2', 'log_SalePrice')) %>% 
+  train(SalePrice ~ ., 
+        data = .,
+        method = 'xgbTree',
+        trControl = xgb_control)
 
+summary(xgb_model)
+
+# Predicitons -------------------------------------------------------------
+
+lm_pred <- predict(lm_model, test)
+test$lm_pred <- lm_pred
+
+lm2_pred <- predict(lm_model_2, test)
+test$lm_2_pred <- 10 ^ lm2_pred
+
+rf_pred <- predict(rf_model, test)
+test$rf_pred <- rf_pred
+
+xgb_pred <- predict(xgb_model, test)
+test$xgb_pred <- xgb_pred
