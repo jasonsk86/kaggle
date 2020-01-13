@@ -263,7 +263,6 @@ test <- df[idx == 0, ]
 
 # >> Using original Sale Price -----------------------------------------------
 
-
 lm_model <- train %>% 
   select(-one_of('pc1', 'pc2', 'log_SalePrice')) %>% 
   lm(SalePrice ~ ., data = .)
@@ -287,21 +286,14 @@ summary(lm_model_2)$adj.r.squared
 lm_model_2_sum
 
 
-# Using PCA ---------------------------------------------------------------
-
-lm_model_3 <- train %>% 
-  select(pc1, pc2, SalePrice) %>% 
-  lm(SalePrice ~ ., data = .)
-
-lm_model_3_sum <- tidy(lm_model_3)
-
-summary(lm_model_3)$r.squared
-summary(lm_model_3)$adj.r.squared
-lm_model_3_sum
-
 # Random forest -----------------------------------------------------------
 
+
 rf_control <- trainControl(method = "none")
+
+# add cross-validation and hyper-parameter tuning
+#rf_control <- trainControl(method = "repeated_cv", number = 10, repeats = 2,
+#                           search = "random")
 
 rf_model <- train %>% 
   select(-one_of('pc1', 'pc2', 'log_SalePrice')) %>% 
@@ -309,7 +301,9 @@ rf_model <- train %>%
         data = .,
         method = 'rf', 
         trControl = rf_control,
-        ntree = 100)
+        ntree = 100,
+        #tuneLength = 3
+        )
 
 summary(rf_model)
 
