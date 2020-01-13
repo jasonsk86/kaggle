@@ -12,6 +12,7 @@ library(car)
 library(broom)
 library(tidylog)
 
+
 # Global setup ------------------------------------------------------------
 
 theme_set(ggthemes::theme_economist())
@@ -286,6 +287,18 @@ summary(lm_model_2)$adj.r.squared
 lm_model_2_sum
 
 
+# Using PCA ---------------------------------------------------------------
+
+lm_model_3 <- train %>% 
+  select(pc1, pc2, SalePrice) %>% 
+  lm(SalePrice ~ ., data = .)
+
+lm_model_3_sum <- tidy(lm_model_3)
+
+summary(lm_model_3)$r.squared
+summary(lm_model_3)$adj.r.squared
+lm_model_3_sum
+
 # Random forest -----------------------------------------------------------
 
 rf_control <- trainControl(method = "none")
@@ -302,7 +315,7 @@ summary(rf_model)
 
 # Gradient boosting -------------------------------------------------------
 
-xgb_control <- trainControl(method = "none")
+xgb_control <- trainControl(method = "repeatedcv", number = 10, repeats = 2, search = "random")
 
 xgb_model <- train %>% 
   select(-one_of('pc1', 'pc2', 'log_SalePrice')) %>% 
@@ -319,10 +332,45 @@ lm_pred <- predict(lm_model, test)
 test$lm_pred <- lm_pred
 
 lm2_pred <- predict(lm_model_2, test)
-test$lm_2_pred <- 10 ^ lm2_pred
+test$lm2_pred <- 10 ^ lm2_pred
 
 rf_pred <- predict(rf_model, test)
 test$rf_pred <- rf_pred
 
 xgb_pred <- predict(xgb_model, test)
 test$xgb_pred <- xgb_pred
+
+
+
+# Evaluation --------------------------------------------------------------
+
+root_mean_squared_error <- function(pred) {
+  sqrt(mean((test$SalePrice - pred)^2))
+}
+
+mean_absolute_error <- function(pred) {
+  mean(abs(test$SalePrice - pred))
+}
+
+
+
+# summarise by root mean squared error
+test %>% 
+  select(contains("pred")) %>% 
+  summarise_all(list(~root_mean_squared_error(.), ~mean_absolute_error(.))) %>% 
+  pivot_longer(cols = everything(),
+               names_to = "key",
+               values_to = "value") %>% 
+  mutate(key = str_replace_all(key, "pred_", ""),
+         model = str_extract(key, "^[^_]*"),
+         metric = str_replace_all(key, paste0(model, "_"), "")) %>% 
+  ggplot() +
+  geom_bar(stat = "identity", aes(x = model, y = value, fill = "firebrick")) +
+  scale_y_continuous(label = scales::comma) +
+  facet_wrap(~metric, scales = "free_y") +
+  theme(legend.position = "none")
+
+
+# lm2 appears to have the better evaluation metrics for rmse and mae. That is the model that was trained on log transform of 
+# Sale Price, with predictions then converted back to the original scale
+
